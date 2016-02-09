@@ -224,7 +224,7 @@ func (b *Bot) Sync(pr PullRequest) error {
 
 	// TODO: don't hardcode these.
 	grInst := "camlistore"
-	proj := "review-github-camlistore-go4-dev13"
+	proj := "review-github-camlistore-go4-dev14"
 
 	pi, err := b.gr.GetProjectInfo(proj)
 	if err != nil {
@@ -241,6 +241,38 @@ func (b *Bot) Sync(pr PullRequest) error {
 	gitDir := filepath.Join(homeDir(), "var", "letsusegerrit", "git-tmp-"+proj)
 	if err := os.MkdirAll(gitDir, 0700); err != nil {
 		return err
+	}
+
+	branch := fmt.Sprintf("PR/%d", pr.Number)
+
+	q := "project:" + proj + " branch:" + branch
+	log.Printf("Running search query: %q", q)
+	cis, err := b.gr.QueryChanges(q, gerrit.QueryChangesOpt{Fields: []string{"CURRENT_REVISION"}})
+	log.Printf("Query %q = %d results, %v", q, len(cis), err)
+	if err != nil {
+		return fmt.Errorf("Gerrit.QueryChanges = %v", err)
+	}
+
+	var changeNum int
+
+	updateGithubComment := func() error {
+		return b.CommentGithubNoDup(pr.Owner, pr.Repo.Repo, pr.Number,
+			fmt.Sprintf("Gerrit code review: https://%s-review.googlesource.com/%d (at git rev %s)", grInst, changeNum, headSHA[:7]))
+	}
+
+	if len(cis) > 0 {
+		// If it's more than 1, we pick the lowest.
+		var changeInfo *gerrit.ChangeInfo
+		for _, ci := range cis {
+			if changeNum == 0 || ci.ChangeNumber < changeNum {
+				changeNum = ci.ChangeNumber
+				changeInfo = ci
+			}
+		}
+		if changeInfo.CurrentRevision == headSHA {
+			log.Printf("Gerrit is up-to-date.")
+			return updateGithubComment()
+		}
 	}
 
 	git := func(args ...string) *exec.Cmd {
@@ -276,9 +308,6 @@ func (b *Bot) Sync(pr PullRequest) error {
 		}
 	}
 
-	cid := pr.ChangeID()
-	var hdrs map[string][]string
-	var body string
 	var parent string
 
 	// Get raw commit, both to verify that we got it above, and to verify it
@@ -292,12 +321,7 @@ func (b *Bot) Sync(pr PullRequest) error {
 		if err != nil {
 			return fmt.Errorf("git cat-file %s: %v, %s", *prd.Head.SHA, err, errbuf.Bytes())
 		}
-		hdrs, body = parseRawGitCommit(out)
-		log.Printf("Raw: %v, %s", hdrs, body)
-		m := changeIdRx.FindStringSubmatch(body)
-		if m != nil && m[1] != cid {
-			return fmt.Errorf("Head git commit %v contains Gerrit Change-Id line in commit message, but of unexpected value. Delete, or change it to %v", *prd.Head.SHA, cid)
-		}
+		hdrs, _ := parseRawGitCommit(out)
 		parents := hdrs["parent"]
 		if len(parents) != 1 {
 			return fmt.Errorf("Head git commit %v has %d parents. LetsUseGerrit does not support reviewing merge commits.",
@@ -306,41 +330,8 @@ func (b *Bot) Sync(pr PullRequest) error {
 		parent = parents[0]
 	}
 
-	log.Printf("Does %v exist?", cid)
-
-	q := "change:" + cid + " project:" + proj
-	log.Printf("Running search query: %q", q)
-	cis, err := b.gr.QueryChanges(q, gerrit.QueryChangesOpt{Fields: []string{"CURRENT_REVISION"}})
-	log.Printf("Query %q = %d results, %v", q, len(cis), err)
-	if err != nil {
-		return err
-	}
-	var changeNum int
-	if len(cis) == 1 {
-		changeNum = cis[0].ChangeNumber
-		log.Printf("Exists: %#v", cis[0])
-		if cis[0].CurrentRevision == headSHA {
-			log.Printf("Gerrit is up-to-date.")
-			return b.CommentGithubNoDup(pr.Owner, pr.Repo.Repo, pr.Number,
-				fmt.Sprintf("Gerrit code review: https://%s-review.googlesource.com/%d", grInst, changeNum))
-		}
-	}
-	log.Printf("matches: %v", len(cis))
-	if len(cis) == 0 {
-		log.Printf("Need to make a commit.")
-
-		if err := git("reset", "--hard", parent).Run(); err != nil {
-			return fmt.Errorf("git reset making dummy base commit: %v", err)
-		}
-		if err := git("commit", "--allow-empty", "-m",
-			body+"\n\n"+
-				"(This is a dummy commit for @LetsUseGerrit to create a Gerrit Change-Id)\n\n"+
-				"Change-Id: "+cid+"\n").Run(); err != nil {
-			return fmt.Errorf("git commit making dummy base commit: %v", err)
-		}
-
-		branch := fmt.Sprintf("PR/%d", pr.Number)
-		log.Printf("Setting refs/heads/%s", branch)
+	if changeNum == 0 {
+		log.Printf("Need to make first commit in refs/heads/%s; pushing parent %s", branch, parent)
 		if out, err := git("push", "-f",
 			"https://camlistore-review.googlesource.com/"+proj,
 			parent+":refs/heads/"+branch).Output(); err != nil {
@@ -348,42 +339,31 @@ func (b *Bot) Sync(pr PullRequest) error {
 				parent, branch, err, out)
 		}
 
-		log.Printf("Pushing dummy commit.")
+		log.Printf("Pushing PR's head commit %s to refs/for/%s", headSHA, branch)
 		out, err := git(
 			"push",
 			"https://camlistore-review.googlesource.com/"+proj,
-			"HEAD:refs/for/"+branch).CombinedOutput()
-		log.Printf("Push of dummy commit: %v", err)
+			headSHA+":refs/for/"+branch).CombinedOutput()
 		if err != nil {
-			return fmt.Errorf("git push making dummy base commit: %v, %s", err, out)
+			return fmt.Errorf("git push: %v, %s", err, out)
 		}
 		m := gitNewChangeRx.FindStringSubmatch(string(out))
 		if m == nil {
-			return fmt.Errorf("git push making dummy base commit: unexpected output: %s", out)
+			return fmt.Errorf("git push expected a change number in output; got: %s", out)
 		}
 		changeNum, err = strconv.Atoi(m[1])
 		if err != nil {
 			return fmt.Errorf("Atoi(%q) after git push of new change: %v", m[1], err)
 		}
-	} else if len(cis) != 1 {
-		return fmt.Errorf("unexpected %d matches looking for change-id %s in project %s", len(cis), cid, proj)
-	}
-
-	log.Printf("Pushing %v to refs/changes/%d ...", headSHA, changeNum)
-	// Push again
-	{
-		push := git("push",
+	} else {
+		log.Printf("Pushing %v to refs/changes/%d", headSHA, changeNum)
+		if out, err := git("push",
 			"https://camlistore-review.googlesource.com/"+proj,
-			headSHA+":refs/changes/"+strconv.Itoa(changeNum))
-		push.Stdout = os.Stdout
-		push.Stderr = os.Stderr
-		if err := push.Run(); err != nil {
-			return fmt.Errorf("git push of head commit %s: %v", headSHA, err)
+			headSHA+":refs/changes/"+strconv.Itoa(changeNum)).Output(); err != nil {
+			return fmt.Errorf("git push of head commit %s: %v, %s", headSHA, err, out)
 		}
 	}
-	cd, err := b.gr.GetChangeDetail(proj + "~master~" + cid)
-	log.Printf("Change detail = %+v, %v", cd, err)
-	return nil
+	return updateGithubComment()
 }
 
 func main() {
