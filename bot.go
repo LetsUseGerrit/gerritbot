@@ -60,6 +60,33 @@ func (pr PullRequest) ChangeID() string {
 	return fmt.Sprintf("I%x", d.Sum(nil))
 }
 
+type GerritProject struct {
+	// Instance is the googlesource.com Gerrit instance
+	// hostname. ("go", "code", "camlistore", etc.)
+	Instance string
+
+	// Project is the Gerrit project name on Instance.
+	Project string
+}
+
+func (gp GerritProject) Client() *gerrit.Client {
+	cookieFile := filepath.Join(homeDir(), "keys", "gerrit-letsusegerrit.cookies")
+	if _, err := os.Stat(cookieFile); err != nil {
+		log.Fatalf("Can't stat cookie file for Gerrit: %v", cookieFile)
+	}
+	return gerrit.NewClient("https://"+gp.Instance+"-review.googlesource.com", gerrit.GitCookieFileAuth(cookieFile))
+}
+
+func (pr PullRequest) GerritProject() GerritProject {
+	if pr.Repo.Owner == "camlistore" && pr.Repo.Repo == "go4" {
+		return GerritProject{"camlistore", "review-go4"}
+	}
+	if pr.Repo.Owner == "grpc" && pr.Repo.Repo == "grpc-go" {
+		return GerritProject{"go", "grpc-review"}
+	}
+	return GerritProject{"code", strings.ToLower(fmt.Sprintf("review-github-%s-%s", pr.Repo.Owner, pr.Repo.Repo))}
+}
+
 type logConn struct {
 	net.Conn
 }
@@ -92,7 +119,6 @@ var verboseHTTP = flag.Bool("verbose_http", false, "Verbose HTTP debugging")
 
 type Bot struct {
 	gh *github.Client
-	gr *gerrit.Client
 }
 
 func NewBot() *Bot {
@@ -105,15 +131,8 @@ func NewBot() *Bot {
 		oauth2.StaticTokenSource(&oauth2.Token{AccessToken: githubToken}),
 	))
 
-	cookieFile := filepath.Join(homeDir(), "keys", "gerrit-letsusegerrit.cookies")
-	if _, err := os.Stat(cookieFile); err != nil {
-		log.Fatalf("Can't stat cookie file for Gerrit: %v", cookieFile)
-	}
-	gr := gerrit.NewClient("https://camlistore-review.googlesource.com", gerrit.GitCookieFileAuth(cookieFile))
-
 	return &Bot{
 		gh: gh,
-		gr: gr,
 	}
 }
 
@@ -180,8 +199,8 @@ func (b *Bot) CommentGithubNoDup(owner, repo string, number int, comment string)
 	return b.CommentGithub(owner, repo, number, comment)
 }
 
-func (b *Bot) CommentGerrit(number int, comment string) error {
-	return b.gr.SetReview(fmt.Sprint(number), "current", gerrit.ReviewInput{
+func (b *Bot) CommentGerrit(gr *gerrit.Client, number int, comment string) error {
+	return gr.SetReview(fmt.Sprint(number), "current", gerrit.ReviewInput{
 		Message: comment,
 	})
 }
@@ -202,7 +221,7 @@ func (b *Bot) Sync(pr PullRequest) error {
 		return err
 	}
 	if prd.Head == nil || prd.Base == nil || prd.State == nil || prd.Title == nil || prd.Commits == nil {
-		return errors.New("nil fields")
+		return errors.New("nil fields from github API")
 	}
 	if *prd.Commits == 0 {
 		// Um, nothing to do?
@@ -222,15 +241,18 @@ func (b *Bot) Sync(pr PullRequest) error {
 	headSHA := *prd.Head.SHA
 	log.Printf("Base: %s  Head: %s", baseSHA, headSHA)
 
-	// TODO: don't hardcode these.
-	grInst := "camlistore"
-	proj := "review-github-camlistore-go4-dev14"
+	gp := pr.GerritProject()
+	grInst := gp.Instance
+	proj := gp.Project
+	//log.Fatalf("Got: %+v %v, %v", gp, grInst, proj)
 
-	pi, err := b.gr.GetProjectInfo(proj)
+	gr := gp.Client()
+
+	pi, err := gr.GetProjectInfo(proj)
 	if err != nil {
 		log.Printf("gerrit project %s: %v", proj, err)
 		if err == gerrit.ErrProjectNotExist {
-			pi, err = b.gr.CreateProject(proj)
+			pi, err = gr.CreateProject(proj)
 			if err != nil {
 				return fmt.Errorf("error creating gerrit project %s: %v", proj, err)
 			}
@@ -247,7 +269,7 @@ func (b *Bot) Sync(pr PullRequest) error {
 
 	q := "project:" + proj + " branch:" + branch
 	log.Printf("Running search query: %q", q)
-	cis, err := b.gr.QueryChanges(q, gerrit.QueryChangesOpt{Fields: []string{"CURRENT_REVISION"}})
+	cis, err := gr.QueryChanges(q, gerrit.QueryChangesOpt{Fields: []string{"CURRENT_REVISION"}})
 	log.Printf("Query %q = %d results, %v", q, len(cis), err)
 	if err != nil {
 		return fmt.Errorf("Gerrit.QueryChanges = %v", err)
@@ -333,7 +355,7 @@ func (b *Bot) Sync(pr PullRequest) error {
 	if changeNum == 0 {
 		log.Printf("Need to make first commit in refs/heads/%s; pushing parent %s", branch, parent)
 		if out, err := git("push", "-f",
-			"https://camlistore-review.googlesource.com/"+proj,
+			"https://"+grInst+"-review.googlesource.com/"+proj,
 			parent+":refs/heads/"+branch).Output(); err != nil {
 			return fmt.Errorf("git push of parent %s to refs/heads/%s: %v, %s",
 				parent, branch, err, out)
@@ -342,7 +364,7 @@ func (b *Bot) Sync(pr PullRequest) error {
 		log.Printf("Pushing PR's head commit %s to refs/for/%s", headSHA, branch)
 		out, err := git(
 			"push",
-			"https://camlistore-review.googlesource.com/"+proj,
+			"https://"+grInst+"-review.googlesource.com/"+proj,
 			headSHA+":refs/for/"+branch).CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("git push: %v, %s", err, out)
@@ -358,7 +380,7 @@ func (b *Bot) Sync(pr PullRequest) error {
 	} else {
 		log.Printf("Pushing %v to refs/changes/%d", headSHA, changeNum)
 		if out, err := git("push",
-			"https://camlistore-review.googlesource.com/"+proj,
+			"https://"+grInst+"-review.googlesource.com/"+proj,
 			headSHA+":refs/changes/"+strconv.Itoa(changeNum)).Output(); err != nil {
 			return fmt.Errorf("git push of head commit %s: %v, %s", headSHA, err, out)
 		}
@@ -370,9 +392,22 @@ func main() {
 	flag.Parse()
 	readGithubConfig()
 
-	bot := NewBot()
+	if flag.NArg() != 1 {
+		log.Fatalf("Usage: bot.go <URL of pull request>")
+	}
 
-	log.Printf("Sync = %v", bot.Sync(PullRequest{Repo{Owner: "camlistore", Repo: "go4"}, 13}))
+	m := regexp.MustCompile(`^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)`).FindStringSubmatch(flag.Arg(0))
+	if m == nil {
+		log.Fatalf("Unrecognized pull request URL %q", flag.Arg(0))
+	}
+	n, _ := strconv.Atoi(m[3])
+	pr := PullRequest{
+		Repo:   Repo{Owner: m[1], Repo: m[2]},
+		Number: n,
+	}
+
+	bot := NewBot()
+	log.Printf("Sync of %s = %v", flag.Arg(0), bot.Sync(pr))
 }
 
 func fs(s *string) string {
