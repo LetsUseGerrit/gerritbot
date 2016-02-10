@@ -297,6 +297,12 @@ func (b *Bot) Sync(pr PullRequest) error {
 		}
 	}
 
+	// Hard-code an ongoing review which predates some of the conventions in this tool.
+	if pr.Number == 514 && pr.Owner == "grpc" {
+		changeNum = 19272
+		branch = "master"
+	}
+
 	git := func(args ...string) *exec.Cmd {
 		args = append([]string{
 			"-c", "http.cookiefile=/home/bradfitz/keys/gerrit-letsusegerrit.cookies",
